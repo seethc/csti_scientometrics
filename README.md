@@ -17,6 +17,8 @@ http://127.0.0.1:8765
 
 The opening dashboard counts publication records by patent office/country, de-duplicated simple-family country coverage, top applicants, top owners, legal status, and publication year.
 
+Use the **Open CSV** picker in the sidebar to load another export without restarting the app. The selected CSV is uploaded only to the local Python server running on your machine and is kept in memory for that session.
+
 The app defaults to:
 
 ```text

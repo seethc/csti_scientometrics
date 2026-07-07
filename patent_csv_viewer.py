@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import re
 import sys
@@ -12,6 +13,8 @@ import threading
 import webbrowser
 from collections import Counter
 from datetime import datetime
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -154,6 +157,31 @@ APP_HTML = r"""<!doctype html>
     .filter-stack {
       display: grid;
       gap: 14px;
+    }
+
+    .open-panel {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 12px;
+    }
+
+    .open-panel input[type="file"] {
+      width: 100%;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .open-status {
+      min-height: 17px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
     }
 
     .field {
@@ -609,6 +637,17 @@ APP_HTML = r"""<!doctype html>
         <div class="file" id="fileMeta">Loading CSV...</div>
       </div>
 
+      <div class="open-panel">
+        <div class="field">
+          <label for="csvFileInput">Open CSV</label>
+          <input id="csvFileInput" type="file" accept=".csv,text/csv">
+        </div>
+        <div class="button-row">
+          <button class="button primary" id="openCsvButton" type="button">Open</button>
+        </div>
+        <div class="open-status" id="openStatus"></div>
+      </div>
+
       <div class="filter-stack">
         <div class="field">
           <label for="searchInput">Search</label>
@@ -756,6 +795,9 @@ APP_HTML = r"""<!doctype html>
     const resultStatus = document.getElementById("resultStatus");
     const insightsTab = document.getElementById("insightsTab");
     const recordsTab = document.getElementById("recordsTab");
+    const csvFileInput = document.getElementById("csvFileInput");
+    const openCsvButton = document.getElementById("openCsvButton");
+    const openStatus = document.getElementById("openStatus");
 
     function text(value) {
       return value === null || value === undefined || value === "" ? "" : String(value);
@@ -806,6 +848,14 @@ APP_HTML = r"""<!doctype html>
       recordsTab.classList.toggle("active", !insightsActive);
     }
 
+    function resetFilters() {
+      Object.values(controls).forEach((control) => {
+        if (control.tagName === "SELECT") control.selectedIndex = 0;
+        else control.value = "";
+      });
+      controls.sort.value = "publication_date";
+    }
+
     function params(resetOffset) {
       if (resetOffset) state.offset = 0;
       const query = new URLSearchParams();
@@ -840,6 +890,37 @@ APP_HTML = r"""<!doctype html>
       fillSelect(controls.type, metadata.document_types, "Any type", (item) => `${item[0]} (${item[1]})`);
       fillSelect(controls.applicant, metadata.applicants, "Any applicant", (item) => `${item[0]} (${item[1]})`);
       fillSelect(controls.cpc, metadata.cpc_classes, "Any CPC class", (item) => `${item[0]} (${item[1]})`);
+    }
+
+    async function openCsvFile() {
+      const file = csvFileInput.files[0];
+      if (!file) {
+        openStatus.textContent = "Choose a CSV file first.";
+        return;
+      }
+
+      openCsvButton.disabled = true;
+      openStatus.textContent = `Opening ${file.name}...`;
+      const form = new FormData();
+      form.append("csv_file", file, file.name);
+
+      try {
+        const response = await fetch("/api/load_csv", { method: "POST", body: form });
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || response.statusText);
+        }
+        const metadata = await response.json();
+        resetFilters();
+        setView("insights");
+        await loadMetadata();
+        await loadRecords(true);
+        openStatus.textContent = `Opened ${metadata.file_name}.`;
+      } catch (error) {
+        openStatus.textContent = error.message;
+      } finally {
+        openCsvButton.disabled = false;
+      }
     }
 
     async function loadRecords(resetOffset = true) {
@@ -1139,16 +1220,13 @@ APP_HTML = r"""<!doctype html>
 
     document.getElementById("applyButton").addEventListener("click", () => loadRecords(true));
     document.getElementById("resetButton").addEventListener("click", () => {
-      Object.values(controls).forEach((control) => {
-        if (control.tagName === "SELECT") control.selectedIndex = 0;
-        else control.value = "";
-      });
-      controls.sort.value = "publication_date";
+      resetFilters();
       loadRecords(true);
     });
     moreButton.addEventListener("click", () => loadRecords(false));
     insightsTab.addEventListener("click", () => setView("insights"));
     recordsTab.addEventListener("click", () => setView("records"));
+    openCsvButton.addEventListener("click", openCsvFile);
 
     controls.search.addEventListener("input", debounce(() => loadRecords(true), 300));
     ["year", "jurisdiction", "status", "type", "applicant", "cpc", "sort"].forEach((name) => {
@@ -1195,6 +1273,15 @@ def family_key(row: dict[str, str], member_field: str) -> tuple[str, ...]:
     return (row.get("_id", ""),)
 
 
+def decode_csv_bytes(contents: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return contents.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return contents.decode("utf-8", errors="replace")
+
+
 def to_int(value: Any) -> int:
     try:
         return int(str(value or "0").replace(",", "").strip() or 0)
@@ -1220,6 +1307,10 @@ def public_row(row: dict[str, str]) -> dict[str, str]:
 class PatentDataset:
     def __init__(self, csv_path: Path):
         self.csv_path = csv_path
+        self.source_name = csv_path.name
+        self.source_path = str(csv_path)
+        self.last_modified = ""
+        self._uploaded = False
         self.rows: list[dict[str, str]] = []
         self.fieldnames: list[str] = []
         self.record_by_id: dict[str, dict[str, str]] = {}
@@ -1228,6 +1319,8 @@ class PatentDataset:
         self.load()
 
     def ensure_current(self) -> None:
+        if self._uploaded:
+            return
         try:
             mtime = self.csv_path.stat().st_mtime
         except FileNotFoundError:
@@ -1242,19 +1335,51 @@ class PatentDataset:
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
 
         with self.csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            rows = []
-            for index, row in enumerate(reader, start=1):
-                clean_row = {key: (value or "").strip() for key, value in row.items() if key is not None}
-                clean_row["_row_number"] = str(index)
-                clean_row["_id"] = clean_row.get("Lens ID") or clean_row.get("Display Key") or str(index)
-                clean_row["_search"] = " ".join(clean_row.get(field, "") for field in SEARCH_FIELDS).lower()
-                rows.append(clean_row)
+            rows, fieldnames = self._read_rows(handle)
 
+        stat = self.csv_path.stat()
+        self._set_rows(rows, fieldnames)
+        self.source_name = self.csv_path.name
+        self.source_path = str(self.csv_path)
+        self.last_modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        self._uploaded = False
+        self._mtime = stat.st_mtime
+
+    def load_uploaded(self, filename: str, contents: bytes) -> dict[str, Any]:
+        text = decode_csv_bytes(contents)
+        with io.StringIO(text, newline="") as handle:
+            rows, fieldnames = self._read_rows(handle)
+
+        with self._lock:
+            self._set_rows(rows, fieldnames)
+            self.source_name = Path(filename or "uploaded.csv").name
+            self.source_path = "Browser upload"
+            self.last_modified = datetime.now().strftime("%Y-%m-%d %H:%M")
+            self._uploaded = True
+            self._mtime = 0.0
+        return self.metadata()
+
+    def _read_rows(self, handle: Any) -> tuple[list[dict[str, str]], list[str]]:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError("CSV file needs a header row.")
+
+        rows = []
+        id_counts: Counter[str] = Counter()
+        for index, row in enumerate(reader, start=1):
+            clean_row = {key: (value or "").strip() for key, value in row.items() if key is not None}
+            clean_row["_row_number"] = str(index)
+            base_id = clean_row.get("Lens ID") or clean_row.get("Display Key") or str(index)
+            id_counts[base_id] += 1
+            clean_row["_id"] = base_id if id_counts[base_id] == 1 else f"{base_id}#{id_counts[base_id]}"
+            clean_row["_search"] = " ".join(clean_row.get(field, "") for field in SEARCH_FIELDS).lower()
+            rows.append(clean_row)
+        return rows, list(reader.fieldnames or [])
+
+    def _set_rows(self, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
         self.rows = rows
-        self.fieldnames = list(reader.fieldnames or [])
+        self.fieldnames = fieldnames
         self.record_by_id = {row["_id"]: row for row in rows}
-        self._mtime = self.csv_path.stat().st_mtime
 
     def metadata(self) -> dict[str, Any]:
         self.ensure_current()
@@ -1268,11 +1393,10 @@ class PatentDataset:
             applicants.update(split_multi(row.get("Applicants")))
             cpc_classes.update(split_multi(row.get("CPC Classifications")))
 
-        stat = self.csv_path.stat()
         return {
-            "file_name": self.csv_path.name,
-            "file_path": str(self.csv_path),
-            "last_modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "file_name": self.source_name,
+            "file_path": self.source_path,
+            "last_modified": self.last_modified,
             "row_count": len(self.rows),
             "columns": self.fieldnames,
             "years": years,
@@ -1469,9 +1593,29 @@ def json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def uploaded_csv_from_multipart(content_type: str, body: bytes) -> tuple[str, bytes]:
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise ValueError("Expected a CSV file upload.")
+
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    )
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name != "csv_file":
+            continue
+        filename = part.get_filename() or "uploaded.csv"
+        contents = part.get_payload(decode=True) or b""
+        if not contents:
+            raise ValueError("The selected CSV file is empty.")
+        return filename, contents
+    raise ValueError("Choose a CSV file first.")
+
+
 def make_handler(dataset: PatentDataset) -> type[BaseHTTPRequestHandler]:
     class PatentRequestHandler(BaseHTTPRequestHandler):
         server_version = "PatentCSVViewer/1.0"
+        max_upload_bytes = 250 * 1024 * 1024
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -1499,11 +1643,35 @@ def make_handler(dataset: PatentDataset) -> type[BaseHTTPRequestHandler]:
             except Exception as exc:  # pragma: no cover - defensive for local app errors
                 self.send_error(500, str(exc))
 
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path != "/api/load_csv":
+                    self.send_error(404, "Not found")
+                    return
+
+                content_length = int(self.headers.get("Content-Length", "0") or 0)
+                if content_length <= 0:
+                    raise ValueError("Choose a CSV file first.")
+                if content_length > self.max_upload_bytes:
+                    raise ValueError("CSV upload is larger than 250 MB.")
+
+                body = self.rfile.read(content_length)
+                filename, contents = uploaded_csv_from_multipart(self.headers.get("Content-Type", ""), body)
+                self.send_json(dataset.load_uploaded(filename, contents))
+            except ValueError as exc:
+                self.send_text(str(exc), status=400)
+            except Exception as exc:  # pragma: no cover - defensive for local app errors
+                self.send_text(str(exc), status=500)
+
         def send_json(self, payload: Any) -> None:
             self.send_bytes(json_bytes(payload), "application/json; charset=utf-8")
 
-        def send_bytes(self, body: bytes, content_type: str) -> None:
-            self.send_response(200)
+        def send_text(self, message: str, status: int = 200) -> None:
+            self.send_bytes(message.encode("utf-8"), "text/plain; charset=utf-8", status=status)
+
+        def send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+            self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
